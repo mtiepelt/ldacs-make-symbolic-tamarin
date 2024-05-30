@@ -1,0 +1,341 @@
+///////////////////////////////////////////////////////
+//
+//  LDACS ISO/IEC 11770-3:2021 key agreement mechanism 7 based 3-pass MAKE Protocol - DHKE part
+//
+///////////////////////////////////////////////////////
+
+theory 3_pass_iso_kam7_dhke_a
+begin
+
+builtins: diffie-hellman, symmetric-encryption, signing, hashing
+
+functions: kdf/2, hmac/2
+
+/*:
+// LDACS ISO/IEC 11770-3:2021 key agreement mechanism 7 based 3-pass MAKE Protocol - No ChangeCipherSpec //
+A: GS, B:AS
+1. A -> B: P_A
+// WITH MAC 
+2. A <- B: P_B, ID_A, sign(<P_B, P_A, ID_A>, S_B), hmac(<P_B, P_A, ID_A>, K_AB)
+3. A -> B: ID_B, sign(<P_A, P_B, ID_B>, S_A), hmac(<P_A, P_B, ID_B>, K_AB)
+*/
+
+/////////////////////////////////////
+// Public Key Infrastructure (PKI)
+////////////////////////////////////
+
+// Anyone can register at any time a public key together with its ID
+// But: only once per ID
+rule Register_pk:
+  [ Fr(~S_X) ]
+  --[ OnlyOnceV(pk(~S_X)) ]->
+  [
+    !Ltk($X, ~S_X)
+    , !Pk($X, pk(~S_X))
+    , Out(pk(~S_X)) 
+  ] 
+
+rule CA_init:
+    [ Fr(~S) ]
+    --[ OnlyOnce() ]->
+    [
+        !LtkCA(~S)
+        , !PkCA(pk(~S))
+        , Out(pk(~S)) 
+    ] 
+
+/////////////////////////////////////
+// Attacker
+/////////////////////////////////////
+
+// Compromising an agent's long-term key (denoted as S)
+rule Reveal_ltk:
+  [ !Ltk($X, S_X) ] --[ CorruptedLtk($X) ]-> [ Out(S_X) ]
+  
+// Compromise an agent's DH key
+rule Reveal_dh:
+	[ !DHk($X, DH_X) ] --[CorruptedDHk($X)]-> [ Out(DH_X) ]
+
+// Leaking an agent's session key
+rule Leak_session: 
+   [ !Sessk(s, k) ] --[ Leaked(k) ]-> [ Out(k) ]
+
+
+/////////////////////////////////////
+// Protocol Role Script Start
+/////////////////////////////////////
+
+rule init_A:
+    [ 
+        Fr(~sid)            // generate new A session id
+        , !Ltk($ID_A, S_A)   // get A private key S_A and bind ID_A to S_A (A's long term key)
+    ]
+    --[ Create($ID_A, ~sid) ]->
+    [
+        S_A_0($ID_A, ~sid, S_A),
+        Out(<$ID_A>)
+    ]
+
+rule init_B:
+    [   
+        In(<ID_A>)
+        , Fr(~sid)              // generate new B session id
+        , !Ltk($ID_B, S_B)       // get B private key and bind ID_B to S_B (B's long term key)
+    ]
+    --[ Create($ID_B, ~sid) ]->
+    [ 	
+        S_B_0($ID_B, ~sid, S_B, ID_A)
+        , Out(<$ID_B>)
+    ]
+
+rule A_1:
+    let
+        P_A = 'g'^~r_A  // compute DHKE public A key P_A
+    in
+    [
+        S_A_0(ID_A, sid, S_A) 
+        , In(<ID_B>)
+        , Fr(~r_A)
+    ]
+    --[
+        Running(ID_A, ID_B, sid, P_A)
+    ]->
+    [
+        S_A_1(ID_A, sid, S_A, ID_B, P_A, ~r_A)
+        , !DHk(ID_A, ~r_A)
+        , Out(<P_A>)
+    ]
+
+rule B_1:
+    let
+        P_B = 'g'^~r_B                          // compute DHKE public B key P_B
+        z = <P_A^~r_B>                          // compute A-B shared secret z
+        K_AB = kdf(<z, ID_A, ID_B>,'AB')        // derive A-B shared key; Identity A/B as input for KDF
+
+        SIG_B = sign(<P_B, P_A, ID_A>,S_B)
+        MAC_B = hmac(<P_B, P_A, ID_A>, K_AB)
+
+    in
+    [
+        S_B_0(ID_B, sid, S_B, ID_A)
+        , In(<P_A>)
+        , Fr(~r_B)
+    ]
+    --[
+        Running(ID_B, ID_A, sid, P_B)
+    ]->
+    [
+        S_B_1(ID_B, sid, S_B, ID_A, P_B, ~r_B, P_A, K_AB)
+        , !DHk(ID_B, ~r_B)
+        , Out(<P_B, ID_A, SIG_B, MAC_B>)
+    ]
+
+rule A_2:
+    let
+        z = <P_B^r_A>                           // compute A-B shared secret z
+        K_AB = kdf(<z, ID_A, ID_B>,'AB')        // derive A-B shared key; Identity A/B as input for KDF
+        
+        SIG_A = sign(<P_A, P_B, ID_B>, S_A)
+        MAC_A = hmac(<P_A, P_B, ID_B>, K_AB)
+
+    in
+    [
+        S_A_1(ID_A, sid, S_A, ID_B, P_A, r_A)
+        , In(<P_B, ID_A, SIG_B, MAC_B>)
+        , !Pk(ID_B, V_B) // get B public Ltk key (denoted V_B)
+        , !LtkCA(S_CA)   // A trusts CA; Trust in B comes from the signature of CA of B's certificate
+    ]
+    --[
+        Eq(verify(SIG_B, <P_B, P_A, ID_A>, V_B), true) // verify B's signature
+        , Eq(MAC_B, hmac(<P_B, P_A, ID_A>, K_AB))      // verify B's MAC - proving key consistency/key confirmation
+        , Commit(ID_A, ID_B, sid, <P_A, P_B>)          // Executability
+		, Confirm(ID_A, ID_B, sid, K_AB)               // K_AB key consistency between ID_A, ID_B in session sid
+        , Honest(ID_A), Honest(ID_B)
+    ]->
+    [
+        !Sessk(sid, K_AB)
+        , Out(<ID_B, SIG_A, MAC_A>)
+    ]
+
+rule B_2:
+    [
+        S_B_1(ID_B, sid, S_B, ID_A, P_B, r_B, P_A, K_AB)
+        , In(<ID_B, SIG_A, MAC_A>)
+        , !Pk(ID_A, V_A) // get A public Ltk key (denoted V_A)
+        , !LtkCA(S_CA)   // B trusts CA; Trust in A comes from the signature of CA of A's certificate
+
+    ]
+    --[
+        Eq(verify(SIG_A, <P_A, P_B, ID_B>, V_A), true)  // verify A's signature
+        , Eq(MAC_A, hmac(<P_A, P_B, ID_B>, K_AB))       // verify A's MAC - proving key consistency
+        , Commit(ID_B, ID_A, sid, <P_B, P_A>)           // Executability                                            // Executability
+		, Confirm(ID_B, ID_A, sid, K_AB)                // K_AB key consistency between ID_B, ID_A in session sid
+        , Secret(K_AB)                                  // Check for K_AB secrecy/pfs_secrecy
+        , Honest(ID_B), Honest(ID_A)
+    ]->
+    [
+        !Sessk(sid, K_AB)
+    ]
+
+///////////////////////////////// LEMMAS //////////////////////////////////////////
+
+restriction Equality:
+    "All x y #i. Eq(x,y) @i ==> x = y"
+
+restriction OnlyOnce:
+    "All #i #j. OnlyOnce()@#i & OnlyOnce()@#j ==> #i = #j"
+
+// rules which contain the OnlyOnceV(x)-event will be executed only once per x
+restriction OnlyOnceV:
+    "All #i #j x. OnlyOnceV(x)@#i & OnlyOnceV(x)@#j ==> #i = #j"
+
+/*
+ * session-exist lemmas
+ * verify that the protocol runs through for one session only
+ */
+lemma exists_session:
+    exists-trace
+	"Ex A B sid_a sid_b x y #i #j #k #l #m #n. 
+        Create(A, sid_a)@i & Create(B, sid_b)@j
+            & Running(A, B, sid_a, x)@k& Running(B, A, sid_b, y)@l
+            & Commit(A, B, sid_a, <x, y>)@m & Commit(B, A, sid_b, <y, x>)@n
+            & i < j & j < k & k < l & l < m & m < n "
+	
+
+/* complete more than one full run of the protocol in a single instance
+ * --> allows attacker to use pre-gained knowledge in previous run
+ */
+ 
+lemma exists_two_sessions:
+	exists-trace
+	"Ex A B sid_a sid_a2 sid_b sid_b2 x x2 y y2 #i #j #k #l #m #n #i2 #j2 #k2 #l2 #m2 #n2. 
+        Create(A, sid_a)@i & Create(B, sid_b)@j
+            & Running(A, B, sid_a, x)@k& Running(B, A, sid_b, y)@l
+            & Commit(A, B, sid_a, <x, y>)@m & Commit(B, A, sid_b, <y, x>)@n
+            & i < j & j < k & k < l & l < m & m < n
+            & Create(A, sid_a2)@i2 & Create(B, sid_b2)@j2
+            & Running(A, B, sid_a2, x2)@k2 & Running(B, A, sid_b2, y2)@l2
+            & Commit(A, B, sid_a2, <x2, y2>)@m2 & Commit(B, A, sid_b2, <y2, x2>)@n2
+            & i2 < j2 & j2 < k2 & k2 < l2 & l2 < m2 & m2 < n2
+            & not (x=x2)
+            & not (y=y2)"
+
+/*
+ *   authentication lemmas
+ *
+ * following Lowes hierarchical model of authentication specification 
+ * (https:/ /ieeexplore.ieee.org/document/596782)
+ * Proofing authentication via injective agreement in both directions!
+ *
+ * If A finishes a run with B by exchanging y at time i
+ * he can be sure, B also ran the protocol with A
+ * and y has not been exchanged before in any other run (injective agreement)
+ * the only exclusion is when a LTK has been compromised before
+ */ 
+
+lemma mutual_authentication_A:
+    "All A B x y ia #i. Commit(A, B, ia, <x, y>)@i ==> 
+            ( Ex ib #j. Running(B, A, ib, y)@j
+              & j<i
+              & not (Ex A2 B2 ia2 #i2. Commit(A2, B2, ia2, <x, y>)@i2 & not(#i2=#i))
+            )
+            | (Ex C #r. CorruptedLtk(C)@r & Honest(C)@i & #r<#i)"
+
+// Now for "B" direction		
+lemma mutual_authentication_B:
+    "All A B x y ia #i. Commit(B, A, ia, <y, x>)@i ==> 
+            ( Ex ib #j. Running(A, B, ib, x)@j
+              & j<i
+              & not (Ex A2 B2 ia2 #i2. Commit(B2, A2, ia2, <y, x>)@i2 & not(#i2=#i))
+            )
+            | (Ex C #r. CorruptedLtk(C)@r & Honest(C)@i & #r<#i)"
+
+
+/*
+ * session uniqueness lemma
+ *
+ * To achieve Lowe's definition of full agreement in a given session the set of values in ds that AS and GS agree on, 
+ * must define a unique run of the protocol between the two parties. 
+ * For this we introduce the property "session uniqness", 
+ * which was defined in the security proof for the Wireguard model 
+ *(https://www.wireguard.com/papers/wireguard-formal-verification.pdf) 
+ * as different sessions will always have different, unique session keys.
+ */
+ lemma session_uniqueness_A:
+    "All A B sid_a sid_b x y #i #j.
+        Commit(A, B, sid_a, <x, y>) @ #i
+        & Commit(A, B, sid_b, <x, y>) @ #j
+    ==> (#i = #j)"
+
+// Now for "B" direction
+lemma session_uniqueness_B:
+    "All A B sid_a sid_b x y #i #j.
+        Commit(B, A, sid_a, <y, x>) @ #i
+        & Commit(B, A, sid_b, <y, x>) @ #j
+    ==> (#i = #j)"
+
+/*
+ * Secrecy:
+ * whenever a secret action Secret(x) occurs at timepoint i, 
+ * the adversary does not know x or x has been leaked or an agent's DH key
+ * was compromised, or an agent's Ltk key was compromised
+ */
+
+lemma secrecy:
+    "All x #i.
+        Secret(x)@i ==> 
+            not (Ex #j. K(x)@j)
+            | (Ex #r. Leaked(x)@r)
+            | (Ex A #r. CorruptedDHk(A)@r)
+            | (Ex A #r. CorruptedLtk(A)@r & Honest(A)@i)"
+
+/*
+ * Perfect Forward Secrecy:
+ * whenever a secret action Secret(x) occurs at timepoint i, 
+ * the adversary does not know x 
+ * or an agent A (AS or GS) claimed to be honest at time point i 
+ * has been compromised at a timepoint r before
+ * -> the point is: he needs to be compromised *before* 
+ * -> if he was compromised *later* all older secrets still remain secret
+*/
+
+lemma secrecy_pfs:
+    "All x #i.
+        Secret(x)@i ==>
+            not (Ex #j. K(x)@j)
+            | (Ex #r. Leaked(x)@r)
+            | (Ex A #r. CorruptedDHk(A)@r)
+            | (Ex A #r. CorruptedLtk(A)@r & Honest(A)@i & r < i)"
+
+/*
+ * Consistency:
+ * For all sessions ia with participants A and B and keys key and key2
+ * when A confirms key key at time i in session ia and 
+ * when B confirms key key2 at time j and in session ia
+ * and no agent was honest before but has been corrupted over time
+ * then key and key2 must be the same
+ * (mutual understanding of key key)
+*/
+
+lemma key_consistency_A:
+	"All A B ia key key2 #i #j .
+		Confirm(A, B, ia, key)@#i
+		& Confirm(B, A, ia, key2)@#j
+        & not (Ex #r. Leaked(key)@r)
+        & not (Ex #r. Leaked(key2)@r)
+		& not (Ex #r. CorruptedLtk(B)@r & Honest(B)@i)
+		& not (Ex #r. CorruptedDHk(B)@r & Honest(B)@i)
+		==> (key = key2)"
+
+// Now for B direction	
+lemma key_consistency_B:
+	"All A B ia key key2 #i #j .
+		Confirm(B, A, ia, key)@#i
+		& Confirm(A, B, ia, key2)@#j
+        & not (Ex #r. Leaked(key)@r)
+        & not (Ex #r. Leaked(key2)@r)
+		& not (Ex #r. CorruptedLtk(A)@r & Honest(A)@i)
+		& not (Ex #r. CorruptedDHk(A)@r & Honest(A)@i)
+		==> (key = key2)"
+
+end
